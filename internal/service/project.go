@@ -41,10 +41,10 @@ func (s *Service) CreateProject(ctx context.Context, p domain.Principal, request
 			return cached, nil
 		}
 	}
-	if err := s.store.CreateProject(ctx, project); err != nil {
-		return domain.Project{}, fmt.Errorf("create project: %w", err)
-	}
 	err = s.store.WithinTx(ctx, func(repo repository.MutationRepository) error {
+		if err := repo.CreateProject(ctx, project); err != nil {
+			return err
+		}
 		event, err := audit.Event(idgen.New("aud"), p, requestID, "project", project.ID, "create", "success", audit.Detail{"status": project.Status}, now)
 		if err != nil {
 			return err
