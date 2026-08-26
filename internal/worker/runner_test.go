@@ -172,6 +172,46 @@ func TestRunnerCancellationReleasesOwnedLease(t *testing.T) {
 	}
 }
 
+func TestRunnerEvaluateFailureRetainsErrorAndAllowsRetry(t *testing.T) {
+	store := newWorkerStore(t)
+	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+	runner := newTestRunner(store, now)
+	runner.interval = time.Second
+	var calls atomic.Int64
+	runner.Register("evaluate_load_run", func(context.Context, domain.Job) error {
+		calls.Add(1)
+		return errors.New("sensor quorum unavailable")
+	})
+	enqueue(t, store, domain.Job{
+		ID:          "job-evaluate",
+		Kind:        "evaluate_load_run",
+		Payload:     []byte(`{"run_id":"run-1"}`),
+		Status:      domain.JobPending,
+		MaxAttempts: 3,
+		AvailableAt: now,
+		CreatedAt:   now,
+	})
+	if err := runner.once(context.Background()); err == nil || err.Error() != "sensor quorum unavailable" {
+		t.Fatalf("first once() error = %v, want sensor quorum unavailable", err)
+	}
+	if _, err := store.ClaimJob(context.Background(), "other-worker", now, time.Minute); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("failed evaluation job claimed during backoff: %v", err)
+	}
+	recovered, err := store.ClaimJob(context.Background(), "other-worker", now.Add(time.Minute), time.Minute)
+	if err != nil {
+		t.Fatalf("retry ClaimJob() error = %v", err)
+	}
+	if recovered.ID != "job-evaluate" || recovered.Attempts != 2 {
+		t.Fatalf("retried job = %+v, want job-evaluate attempts=2", recovered)
+	}
+	if recovered.LastError == "" {
+		t.Fatalf("retried job retained no error: %+v", recovered)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("handler calls = %d, want 1", calls.Load())
+	}
+}
+
 func TestRunnerRegisterRejectsInvalidOrDuplicateHandlers(t *testing.T) {
 	store := newWorkerStore(t)
 	runner := newTestRunner(store, time.Now())

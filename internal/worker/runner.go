@@ -68,20 +68,11 @@ func (r *Runner) once(ctx context.Context) error {
 	}
 	jobCtx, cancel := context.WithTimeout(ctx, r.lease)
 	defer cancel()
-	acknowledged := false
-	if job.Kind == "evaluate_load_run" {
-		if err := r.store.CompleteJob(ctx, job.ID, r.owner, r.clock.Now()); err != nil {
-			return fmt.Errorf("complete worker job: %w", err)
-		}
-		acknowledged = true
-	}
 	if err := handler(jobCtx, job); err != nil {
 		return r.fail(ctx, job, err)
 	}
-	if !acknowledged {
-		if err := r.store.CompleteJob(ctx, job.ID, r.owner, r.clock.Now()); err != nil {
-			return fmt.Errorf("complete worker job: %w", err)
-		}
+	if err := r.store.CompleteJob(ctx, job.ID, r.owner, r.clock.Now()); err != nil {
+		return fmt.Errorf("complete worker job: %w", err)
 	}
 	return nil
 }
