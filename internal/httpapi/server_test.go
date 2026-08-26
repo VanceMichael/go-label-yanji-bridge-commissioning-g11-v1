@@ -481,3 +481,98 @@ func TestOrganizationBoundaryHidesLoadAndDossierResources(t *testing.T) {
 		t.Fatalf("foreign dossier write error = %v, want not found", err)
 	}
 }
+
+func TestCompleteInspectionRollsBackOnInvalidFinding(t *testing.T) {
+	api := newTestAPI(t)
+	contractor := login(t, api, "contractor@example.test", testPassword)
+	supervisor := login(t, api, "supervisor@example.test", testPassword)
+
+	projectResponse := request(t, api.handler, http.MethodPost, "/v1/projects", login(t, api, "owner@example.test", testPassword).Token, map[string]any{
+		"name": "Rollback bridge", "target_open_at": "2026-12-28T00:00:00Z", "timezone": "Asia/Shanghai",
+	}, nil)
+	if projectResponse.Code != http.StatusCreated {
+		t.Fatalf("create project = %d/%s", projectResponse.Code, projectResponse.Body.String())
+	}
+	var project domain.Project
+	if err := json.Unmarshal(projectResponse.Body.Bytes(), &project); err != nil {
+		t.Fatalf("decode project: %v", err)
+	}
+	workResponse := request(t, api.handler, http.MethodPost, "/v1/projects/"+project.ID+"/work-packages", contractor.Token, map[string]any{
+		"code": "ROLLER-COAT", "title": "Roller coating", "scope": "Coating records", "risk": "high", "owner_id": "contractor", "due_at": "2026-10-01T00:00:00Z",
+	}, nil)
+	if workResponse.Code != http.StatusCreated {
+		t.Fatalf("create work = %d/%s", workResponse.Code, workResponse.Body.String())
+	}
+	var work domain.WorkPackage
+	if err := json.Unmarshal(workResponse.Body.Bytes(), &work); err != nil {
+		t.Fatalf("decode work: %v", err)
+	}
+	for _, status := range []domain.WorkStatus{domain.WorkActive, domain.WorkSubmitted} {
+		response := request(t, api.handler, http.MethodPost, "/v1/work-packages/"+work.ID+"/transitions", contractor.Token, map[string]any{"status": status, "version": work.Version}, nil)
+		if response.Code != http.StatusOK {
+			t.Fatalf("transition to %s = %d/%s", status, response.Code, response.Body.String())
+		}
+		if err := json.Unmarshal(response.Body.Bytes(), &work); err != nil {
+			t.Fatalf("decode work transition: %v", err)
+		}
+	}
+	inspectionResponse := request(t, api.handler, http.MethodPost, "/v1/work-packages/"+work.ID+"/inspections", supervisor.Token, map[string]any{
+		"inspector_id": "supervisor", "checklist": "Adhesion", "scheduled_at": "2026-09-10T02:00:00Z",
+	}, nil)
+	if inspectionResponse.Code != http.StatusCreated {
+		t.Fatalf("schedule inspection = %d/%s", inspectionResponse.Code, inspectionResponse.Body.String())
+	}
+	var inspection domain.Inspection
+	if err := json.Unmarshal(inspectionResponse.Body.Bytes(), &inspection); err != nil {
+		t.Fatalf("decode inspection: %v", err)
+	}
+
+	// First finding is valid; the second is malformed (missing due_at). The whole
+	// request must be rejected and leave the inspection scheduled with no findings.
+	invalid := request(t, api.handler, http.MethodPost, "/v1/inspections/"+inspection.ID+"/complete", supervisor.Token, map[string]any{
+		"passed": false,
+		"findings": []map[string]any{
+			{"severity": "major", "summary": "Adhesion below threshold", "due_at": "2026-09-15T00:00:00Z"},
+			{"severity": "major", "summary": "Missing deadline"},
+		},
+	}, nil)
+	if invalid.Code != http.StatusBadRequest || errorCode(t, invalid) != "invalid_request" {
+		t.Fatalf("invalid complete = %d/%s", invalid.Code, invalid.Body.String())
+	}
+
+	stored, err := api.store.GetInspection(context.Background(), supervisor.User.Organization, inspection.ID)
+	if err != nil {
+		t.Fatalf("GetInspection() error = %v", err)
+	}
+	if stored.Status != domain.InspectionScheduled {
+		t.Fatalf("inspection status = %s, want scheduled (no partial progress)", stored.Status)
+	}
+	if stored.Version != inspection.Version {
+		t.Fatalf("inspection version = %d, want %d (no partial update)", stored.Version, inspection.Version)
+	}
+	open, err := api.store.CountOpenFindings(context.Background(), inspection.ID)
+	if err != nil {
+		t.Fatalf("CountOpenFindings() error = %v", err)
+	}
+	if open != 0 {
+		t.Fatalf("open findings = %d, want 0 (no partial findings persisted)", open)
+	}
+
+	// Retry from the original scheduled state must succeed.
+	complete := request(t, api.handler, http.MethodPost, "/v1/inspections/"+inspection.ID+"/complete", supervisor.Token, map[string]any{
+		"passed": false,
+		"findings": []map[string]any{
+			{"severity": "major", "summary": "Adhesion below threshold", "due_at": "2026-09-15T00:00:00Z"},
+		},
+	}, nil)
+	if complete.Code != http.StatusOK {
+		t.Fatalf("retry complete = %d/%s", complete.Code, complete.Body.String())
+	}
+	var completed service.CompleteInspectionResult
+	if err := json.Unmarshal(complete.Body.Bytes(), &completed); err != nil || len(completed.Findings) != 1 {
+		t.Fatalf("decode completed = %+v/%v", completed, err)
+	}
+	if completed.Inspection.Status != domain.InspectionFailed {
+		t.Fatalf("retry inspection status = %s, want failed", completed.Inspection.Status)
+	}
+}

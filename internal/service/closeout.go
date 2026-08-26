@@ -131,37 +131,37 @@ func (s *Service) CompleteInspection(ctx context.Context, p domain.Principal, id
 		return CompleteInspectionResult{}, err
 	}
 	var result CompleteInspectionResult
-	inspection, err := s.store.GetInspection(ctx, p.Organization, id)
-	if err != nil {
-		return CompleteInspectionResult{}, fmt.Errorf("complete inspection transaction: %w", err)
-	}
-	expected := inspection.Version
-	if inspection.Status == domain.InspectionScheduled {
-		if err := inspection.Start(s.clock.Now()); err != nil {
-			return CompleteInspectionResult{}, fmt.Errorf("complete inspection transaction: %w", err)
-		}
-		if err := s.store.UpdateInspection(ctx, inspection, expected); err != nil {
-			return CompleteInspectionResult{}, fmt.Errorf("complete inspection transaction: %w", err)
-		}
-	}
-	for _, finding := range findings {
-		finding.ID = idgen.New("fnd")
-		finding.InspectionID = id
-		finding.Version = 1
-		if err := finding.Validate(); err != nil {
-			return CompleteInspectionResult{}, fmt.Errorf("complete inspection transaction: %w", err)
-		}
-		if err := s.store.CreateFinding(ctx, finding); err != nil {
-			return CompleteInspectionResult{}, fmt.Errorf("complete inspection transaction: %w", err)
-		}
-		result.Findings = append(result.Findings, finding)
-	}
-	err = s.store.WithinTx(ctx, func(repo repository.MutationRepository) error {
+	err := s.store.WithinTx(ctx, func(repo repository.MutationRepository) error {
 		inspection, err := repo.GetInspection(ctx, p.Organization, id)
 		if err != nil {
 			return err
 		}
 		expected := inspection.Version
+		if inspection.Status == domain.InspectionScheduled {
+			if err := inspection.Start(s.clock.Now()); err != nil {
+				return err
+			}
+			if err := repo.UpdateInspection(ctx, inspection, expected); err != nil {
+				return err
+			}
+		}
+		for _, finding := range findings {
+			finding.ID = idgen.New("fnd")
+			finding.InspectionID = id
+			finding.Version = 1
+			if err := finding.Validate(); err != nil {
+				return err
+			}
+			if err := repo.CreateFinding(ctx, finding); err != nil {
+				return err
+			}
+			result.Findings = append(result.Findings, finding)
+		}
+		inspection, err = repo.GetInspection(ctx, p.Organization, id)
+		if err != nil {
+			return err
+		}
+		expected = inspection.Version
 		open, err := repo.CountOpenFindings(ctx, id)
 		if err != nil {
 			return err
