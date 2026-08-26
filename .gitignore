@@ -1,0 +1,6 @@
+/bridgewatch
+/*.db
+/*.db-shm
+/*.db-wal
+/.env
+/coverage.out
